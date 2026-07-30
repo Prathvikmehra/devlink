@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 # pyrefly: ignore [missing-import]
@@ -12,12 +13,16 @@ from fastapi import (
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import httpx
+import secrets
 from app.core.config import settings
 from app.core.security import (
     decode_token,
     is_refresh_token,
     create_verification_token,
 )
+
+_oauth_states: dict[str, datetime] = {}
+_OAUTH_STATE_TTL = timedelta(minutes=10)
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
@@ -35,6 +40,8 @@ from app.schemas.auth import (
     LoginRequest,
     RegisterRequest,
     GitHubLoginRequest,
+    OAuthStateRequest,
+    OAuthStateResponse,
     RefreshTokenRequest,
     LogoutRequest,
     LogoutResponse,
@@ -187,8 +194,26 @@ def logout(
     return auth_service.logout(user_id, refresh_token_str=refresh_token_str)
 
 
-import httpx  # noqa: E402
-from app.schemas.auth import GitHubLoginRequest  # noqa: E402
+@router.post(
+    "/oauth/state",
+    response_model=OAuthStateResponse,
+    summary="Generate OAuth state parameter",
+)
+@limiter.limit("10/minute")
+def generate_oauth_state(
+    request: Request,
+    payload: OAuthStateRequest,
+):
+    state = secrets.token_urlsafe(32)
+    _oauth_states[state] = datetime.now(timezone.utc) + _OAUTH_STATE_TTL
+    return OAuthStateResponse(state=state)
+
+
+def _cleanup_expired_oauth_states():
+    now = datetime.now(timezone.utc)
+    expired = [s for s, exp in _oauth_states.items() if exp < now]
+    for s in expired:
+        _oauth_states.pop(s, None)
 
 
 @router.post(
@@ -202,16 +227,27 @@ async def github_login(
     payload: GitHubLoginRequest,
     db: Session = Depends(get_database),
 ):
-    """
-    Authenticate a user via GitHub OAuth.
-    """
     if not settings.GITHUB_CLIENT_ID or not settings.GITHUB_CLIENT_SECRET:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail="GitHub OAuth is not configured.",
         )
 
-    # 1. Exchange code for access token
+    _cleanup_expired_oauth_states()
+
+    if payload.state:
+        stored_expiry = _oauth_states.pop(payload.state, None)
+        if not stored_expiry:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired OAuth state. Please try logging in again.",
+            )
+        if datetime.now(timezone.utc) > stored_expiry:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OAuth state expired. Please try logging in again.",
+            )
+
     token_url = "https://github.com/login/oauth/access_token"
     headers = {"Accept": "application/json"}
     data = {
@@ -237,7 +273,6 @@ async def github_login(
 
         access_token = token_data["access_token"]
 
-        # 2. Fetch user profile
         user_res = await client.get(
             "https://api.github.com/user",
             headers={"Authorization": f"Bearer {access_token}"},
@@ -249,7 +284,6 @@ async def github_login(
             )
         github_user = user_res.json()
 
-        # 3. Fetch user emails
         emails_res = await client.get(
             "https://api.github.com/user/emails",
             headers={"Authorization": f"Bearer {access_token}"},
@@ -643,30 +677,32 @@ def resend_verification(
     payload: ResendVerificationEmailRequest,
     db: Session = Depends(get_database),
 ):
-    """
-    Placeholder.
-
-    Email sending will be implemented after the
-    SMTP service is added.
-    """
-
     auth_service = AuthService(db)
 
-    user = auth_service.get_user_by_email(
-        payload.email,
-    )
+    user = auth_service.get_user_by_email(payload.email)
 
     if not user:
         return {
             "success": True,
-            "message": ("If the account exists, a verification email has been sent."),
+            "message": "If the account exists, a verification email has been sent.",
         }
 
-    # Generate verification token
-    token = create_verification_token(str(user.id))  # noqa: F841
-    create_verification_token(str(user.id))
-    # TODO:
-    # Send email via SMTP
+    if user.is_verified:
+        return {
+            "success": True,
+            "message": "Email is already verified.",
+        }
+
+    token = create_verification_token(str(user.id))
+    verify_url = f"{settings.FRONTEND_URL}/verify-email?token={token}"
+
+    from app.services.email_service import EmailService
+    EmailService.send_notification_email(
+        to_email=user.email,
+        title="Verify Your DevLink Email",
+        message="Please click the link below to verify your email address. This link will expire in 24 hours.",
+        action_url=verify_url,
+    )
 
     return {
         "success": True,

@@ -46,14 +46,15 @@ class LoginRequest(BaseModel):
 
 class GitHubLoginRequest(BaseModel):
     code: str
+    state: str = ""
 
 
-class GitHubLoginRequest(BaseModel):  # noqa: F811
-    code: str
+class OAuthStateRequest(BaseModel):
+    pass
 
 
-class GitHubLoginRequest(BaseModel):
-    code: str
+class OAuthStateResponse(BaseModel):
+    state: str
 
 
 # ==========================================================
